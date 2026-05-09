@@ -10,11 +10,15 @@ import time
 import os
 import re
 import requests
+import google.generativeai as genai
 
 app = Flask(__name__)
 
 REG = os.getenv('REGISTRATION', 'FA23-BAI-032')
 NEWS_SOURCE = "Aaj News"
+GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', 'AIzaSyAOu10o81kv9giNXIYwW8lTWs0v8F7dix0')
+
+genai.configure(api_key=GEMINI_API_KEY)
 
 
 def create_driver():
@@ -26,6 +30,11 @@ def create_driver():
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--disable-setuid-sandbox")
+    options.add_argument("--single-process")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-backgrounding-occluded-windows")
     # Use Selenium Manager (bundled with selenium) to locate/start compatible driver
     # This avoids webdriver-manager network issues fetching an incompatible release.
     try:
@@ -41,12 +50,19 @@ def create_driver():
         )
 
 
-def summarize_text(text, max_sentences=3):
-    text = re.sub(r"\s+", " ", text).strip()
-    if not text:
-        return ""
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    return ' '.join(sentences[:max_sentences]).strip()
+def summarize_with_gemini(text, keyword):
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        prompt = f"""Summarize the following news article in 2-3 sentences. 
+Article keyword: {keyword}
+Article text:
+{text}
+
+Summary:"""
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        return f"Error summarizing: {str(e)}"
 
 
 def build_search_url(keyword):
@@ -58,31 +74,54 @@ def build_search_url(keyword):
     )
 
 
-def is_article_url(href):
-    if not href:
-        return False
-    if 'english.aaj.tv' not in href and 'aaj.tv' not in href:
-        return False
-    blocked = ['/search', '/tag/', '/category/', '/author/', '/authors/', '/live', '/video', '/podcasts']
-    if any(part in href for part in blocked):
-        return False
-    return bool(re.search(r'/20\d{2}/', href) or '/news/' in href)
-
-
 def find_first_article_link(page_html):
     soup = BeautifulSoup(page_html, 'lxml')
-    candidates = []
-    for a in soup.select('a[href]'):
-        href = a.get('href', '').strip()
-        text = a.get_text(' ', strip=True)
-        if href.startswith('/'):
-            href = f"https://english.aaj.tv{href}"
-        if is_article_url(href):
-            candidates.append((href, text))
-    for href, text in candidates:
-        if text and len(text) > 20:
+    
+    # Save HTML for debugging
+    debug_file = os.path.join(os.getcwd(), 'search_results.html')
+    with open(debug_file, 'w', encoding='utf-8') as f:
+        f.write(page_html)
+    
+    print(f"[DEBUG] HTML saved to {debug_file}", flush=True)
+    print(f"[DEBUG] HTML length: {len(page_html)}", flush=True)
+    
+    # Look for Google Custom Search result links (class="gs-title")
+    gs_links = soup.find_all('a', class_='gs-title')
+    print(f"[DEBUG] Found {len(gs_links)} gs-title links", flush=True)
+    
+    for i, link in enumerate(gs_links):
+        # Try data-ctorig first (original URL)
+        href = link.get('data-ctorig', '').strip()
+        if not href:
+            href = link.get('href', '').strip()
+        print(f"[DEBUG] Link {i}: {href[:100] if href else 'EMPTY'}")
+        
+        if href:
+            # Clean up Google redirect URLs if still present
+            if 'google.com/url' in href:
+                match = re.search(r'q=([^&]+)', href)
+                if match:
+                    import urllib.parse
+                    href = urllib.parse.unquote(match.group(1))
+                    print(f"[DEBUG] Cleaned redirect URL: {href[:100]}")
+            
+            # Make sure it's a valid article URL
+            if 'aajenglish.tv' in href or 'aaj.tv' in href:
+                # Exclude amp pages and search/archive pages
+                if '/amp/' not in href and '/search' not in href:
+                    print(f"[DEBUG] Returning article: {href}")
+                    return href
+    
+    # Fallback: look for any news links
+    print("[DEBUG] No gs-title found, searching all links...")
+    for link in soup.find_all('a'):
+        href = link.get('href', '').strip()
+        if href and 'aajenglish.tv' in href and '/news/' in href and '/amp/' not in href:
+            print(f"[DEBUG] Found fallback link: {href}")
             return href
-    return candidates[0][0] if candidates else ''
+    
+    print("[DEBUG] No article links found!")
+    return ''
 
 
 @app.route('/get', methods=['GET'])
@@ -140,8 +179,7 @@ def get_article_summary():
             paras = soup.find_all('p')
             text = ' '.join([p.get_text() for p in paras])
 
-        summary_core = summarize_text(text)
-        summary = f"{title}. {summary_core}".strip('. ').strip() if title else summary_core
+        summary = summarize_with_gemini(text, keyword)
 
         result = {
             'registration': REG,
