@@ -5,7 +5,6 @@
 # ─────────────────────────────────────────────────────────────────
 FROM python:3.11-slim-bookworm
 
-# Prevent interactive prompts during apt installs
 ENV DEBIAN_FRONTEND=noninteractive
 
 # ── System deps: Chrome prerequisites ────────────────────────────
@@ -54,40 +53,18 @@ RUN wget -q -O /tmp/chrome.deb \
  && rm /tmp/chrome.deb \
  && rm -rf /var/lib/apt/lists/*
 
-# ── Install ChromeDriver that matches the installed Chrome ────────
-# Uses the Chrome for Testing JSON endpoint to fetch the right version
+# ── Install matching ChromeDriver via helper script ───────────────
+COPY get_chromedriver_url.py /tmp/get_chromedriver_url.py
+
 RUN CHROME_VERSION=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+\.\d+') \
- && CHROME_MAJOR=$(echo $CHROME_VERSION | cut -d. -f1) \
- && echo "Chrome version: $CHROME_VERSION (major: $CHROME_MAJOR)" \
- && DRIVER_URL=$(curl -sS \
-      "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json" \
-    | python3 -c "
-import sys, json
-data = json.load(sys.stdin)
-versions = data['versions']
-target = '$CHROME_VERSION'
-major  = '$CHROME_MAJOR'
-# Try exact match first, then latest of same major
-match = None
-for v in reversed(versions):
-    ver = v['version']
-    dls = v.get('downloads', {}).get('chromedriver', [])
-    linux = [d['url'] for d in dls if d['platform'] == 'linux64']
-    if not linux:
-        continue
-    if ver == target:
-        match = linux[0]
-        break
-    if ver.split('.')[0] == major and match is None:
-        match = linux[0]
-print(match or '')
-") \
- && echo "ChromeDriver URL: $DRIVER_URL" \
+ && echo "Detected Chrome: $CHROME_VERSION" \
+ && DRIVER_URL=$(python3 /tmp/get_chromedriver_url.py "$CHROME_VERSION") \
+ && echo "Downloading ChromeDriver from: $DRIVER_URL" \
  && wget -q -O /tmp/chromedriver.zip "$DRIVER_URL" \
  && unzip -q /tmp/chromedriver.zip -d /tmp/chromedriver_extracted \
  && find /tmp/chromedriver_extracted -name "chromedriver" -exec mv {} /usr/local/bin/chromedriver \; \
  && chmod +x /usr/local/bin/chromedriver \
- && rm -rf /tmp/chromedriver.zip /tmp/chromedriver_extracted \
+ && rm -rf /tmp/chromedriver.zip /tmp/chromedriver_extracted /tmp/get_chromedriver_url.py \
  && chromedriver --version
 
 # ── App working directory ─────────────────────────────────────────
@@ -101,12 +78,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
 
 # ── Runtime environment ───────────────────────────────────────────
-# GEMINI_API_KEY must be supplied at `docker run` time via -e
 ENV GEMINI_API_KEY=""
 ENV PYTHONUNBUFFERED=1
 
-# Expose Flask port
 EXPOSE 7000
 
-# ── Entrypoint ────────────────────────────────────────────────────
 CMD ["python", "server.py"]
